@@ -4,7 +4,6 @@
 
 Patch files for to enable uvm (unified virtual memory) in pytorch.
 Torch based applications can run with the PYTORCH_CUDA_ALLOC_CONF parameter below to use the GH200 unified CUDA memory.
-On a GH200 
 
 Original patch source (working for pytorch versions <= 2.2.2): https://github.com/pytorch/pytorch/compare/main...0x804d8000:pytorch:uvm
 
