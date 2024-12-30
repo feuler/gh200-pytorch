@@ -1,0 +1,249 @@
+--- .ci/pytorch/test.sh.orig    2024-12-03 13:17:21.748000000 +0000
++++ .ci/pytorch/test.sh 2024-12-03 13:17:21.748000000 +0000
+@@ -265,6 +265,14 @@
+   export ATEN_CPU_CAPABILITY=avx2
+ fi
+
++test_python_cuda_uvm() {
++  export PYTORCH_CUDA_ALLOC_CONF='use_uvm:True'
++  time python test/test_cuda.py
++  unset PYTORCH_CUDA_ALLOC_CONF
++
++  assert_git_not_dirty
++}
++
+ test_python_legacy_jit() {
+   time python test/run_test.py --include test_jit_legacy test_jit_fuser_legacy --verbose
+   assert_git_not_dirty
+@@ -1534,6 +1542,7 @@
+   install_torchvision
+   install_monkeytype
+   test_python
++  test_python_cuda_uvm
+   test_aten
+   test_vec256
+   test_libtorch
+--- c10/cuda/CUDAAllocatorConfig.cpp.orig       2024-12-03 13:18:19.048000000 +0000
++++ c10/cuda/CUDAAllocatorConfig.cpp    2024-12-03 13:18:19.048000000 +0000
+@@ -15,6 +15,7 @@
+       m_garbage_collection_threshold(0),
+       m_pinned_num_register_threads(1),
+       m_expandable_segments(false),
++      m_use_uvm(false),
+       m_release_lock_on_cudamalloc(false),
+       m_pinned_use_cuda_host_register(false),
+       m_last_allocator_settings("") {
+@@ -277,6 +278,14 @@
+           "Expected a single True/False argument for expandable_segments");
+       config_item_view = config[i];
+       m_expandable_segments = (config_item_view == "True");
++    } else if (config[i] == "use_uvm") {
++      used_native_specific_option = true;
++      consumeToken(config, ++i, ':');
++      ++i;
++      TORCH_CHECK(
++          i < config.size() && (std::string_view(config[i]) == "True" || std::string_view(config[i]) == "False"),
++          "Expected a single True/False argument for use_uvm");
++      m_use_uvm = (config[i] == "True");
+     } else if (
+         // ROCm build's hipify step will change "cuda" to "hip", but for ease of
+         // use, accept both. We must break up the string to prevent hipify here.
+--- c10/cuda/CUDACachingAllocator.cpp.orig      2024-12-03 13:18:37.560000000 +0000
++++ c10/cuda/CUDACachingAllocator.cpp   2024-12-03 13:18:37.560000000 +0000
+@@ -871,20 +871,6 @@
+   }
+ };
+
+-cudaError_t cudaMallocMaybeCapturing(void** p, size_t size) {
+-  if (at::cuda::currentStreamCaptureStatusMayInitCtx() ==
+-      at::cuda::CaptureStatus::None) {
+-    return C10_CUDA_ERROR_HANDLED(cudaMalloc(p, size));
+-  } else {
+-    // It's ok to capture cudaMallocs, as long as we never cudaFree those
+-    // addresses before replay.
+-    // Capturing cudaMalloc behaves nicely: it gives the graph new VA,
+-    // but is ignored (won't leakily allocate new memory) in replays.
+-    at::cuda::CUDAStreamCaptureModeGuard g{cudaStreamCaptureModeRelaxed};
+-    return C10_CUDA_ERROR_HANDLED(cudaMalloc(p, size));
+-  }
+-}
+-
+ template <class T>
+ class RingBuffer {
+  public:
+@@ -1011,6 +997,36 @@
+
+ namespace Native {
+
++namespace {
++
++cudaError_t cudaMallocMaybeUsingUvm(void** p, size_t size) {
++  if (CUDAAllocatorConfig::use_uvm()) {
++    return cudaMallocManaged(p, size);
++  } else {
++    return cudaMalloc(p, size);
++  }
++}
++
++cudaError_t cudaMallocMaybeCapturing(void** p, size_t size) {
++#if !defined(USE_ROCM) || ROCM_VERSION >= 50300
++  if (at::cuda::currentStreamCaptureStatusMayInitCtx() ==
++      at::cuda::CaptureStatus::None) {
++#endif
++    return C10_CUDA_ERROR_HANDLED(cudaMallocMaybeUsingUvm(p, size));
++#if !defined(USE_ROCM) || ROCM_VERSION >= 50300
++  } else {
++    // It's ok to capture cudaMallocs, as long as we never cudaFree those
++    // addresses before replay.
++    // Capturing cudaMalloc behaves nicely: it gives the graph new VA,
++    // but is ignored (won't leakily allocate new memory) in replays.
++    at::cuda::CUDAStreamCaptureModeGuard g{cudaStreamCaptureModeRelaxed};
++    return C10_CUDA_ERROR_HANDLED(cudaMallocMaybeUsingUvm(p, size));
++  }
++#endif
++}
++
++} // namespace
++
+ class DeviceCachingAllocator {
+  private:
+   // lock around all operations
+@@ -1206,6 +1222,34 @@
+               CUDAAllocatorConfig::garbage_collection_threshold() > 0.0)) {
+         garbage_collect_cached_blocks(context);
+       }
++      // Usually we only trigger memory reclaimation on allocation failure.
++      // However, if UVM is in use, we never get allocation failure from CUDA,
++      // so we have to free memory proactively.
++      if (CUDAAllocatorConfig::use_uvm()) {
++        [[maybe_unused]] size_t device_free = 0;
++        size_t device_total = 0;
++        C10_CUDA_CHECK(cudaMemGetInfo(&device_free, &device_total));
++
++        auto allocated_bytes =
++            stats.allocated_bytes[static_cast<size_t>(StatType::AGGREGATE)]
++                .current;
++        auto reserved_bytes =
++            stats.reserved_bytes[static_cast<size_t>(StatType::AGGREGATE)]
++                .current;
++        // We only proactively reclaim memory if we've used up all device
++        // memories. This is consistent with the default behavior when UVM is
++        // not used.
++        if (reserved_bytes > static_cast<int64_t>(device_total) &&
++            // Try reclaiming via the lighter way first, and if it fails..
++            !release_available_cached_blocks(params, context) &&
++            // ... try the harder way. Here we allow a maximum of 1.33x
++            // over-subscription before doing the "hard" reclaimation.
++            reserved_bytes > allocated_bytes * 4 / 3 &&
++            C10_LIKELY(captures_underway.empty())) {
++          release_cached_blocks(context);
++        }
++      }
++
+       // Attempt allocate
+       // WARNING: alloc_block may release the allocator lock when calling
+       // cudaMalloc. So far this function has not modified allocator state, but
+@@ -3462,7 +3506,7 @@
+
+       // Deliberately don't use cudaMallocMaybeCapturing here, to force an error
+       // if someone tries to use forceUncachedAllocator while capturing.
+-      C10_CUDA_CHECK(cudaMalloc(&devPtr, size));
++      C10_CUDA_CHECK(cudaMallocMaybeUsingUvm(&devPtr, size));
+       const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
+       if (C10_UNLIKELY(interp)) {
+         (*interp)->trace_gpu_memory_allocation(
+--- c10/cuda/CUDAAllocatorConfig.h.orig 2024-12-03 13:19:17.272000000 +0000
++++ c10/cuda/CUDAAllocatorConfig.h      2024-12-03 13:19:17.272000000 +0000
+@@ -33,6 +33,10 @@
+ #endif
+   }
+
++  static bool use_uvm() {
++    return instance().m_use_uvm;
++  }
++
+   static bool release_lock_on_cudamalloc() {
+     return instance().m_release_lock_on_cudamalloc;
+   }
+@@ -112,6 +116,7 @@
+   std::atomic<double> m_garbage_collection_threshold;
+   std::atomic<size_t> m_pinned_num_register_threads;
+   std::atomic<bool> m_expandable_segments;
++  std::atomic<bool> m_use_uvm;
+   std::atomic<bool> m_release_lock_on_cudamalloc;
+   std::atomic<bool> m_pinned_use_cuda_host_register;
+   std::string m_last_allocator_settings;
+--- test/test_cuda.py.orig      2024-12-03 13:16:40.108000000 +0000
++++ test/test_cuda.py   2024-12-03 13:16:40.108000000 +0000
+@@ -95,6 +95,7 @@
+ TEST_CUDAMALLOCASYNC = TEST_CUDA and (
+     torch.cuda.get_allocator_backend() == "cudaMallocAsync"
+ )
++TEST_CUDA_UVM = TEST_CUDA and ('use_uvm:True' in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ''))
+ TEST_LARGE_TENSOR = TEST_CUDA
+ TEST_MEDIUM_TENSOR = TEST_CUDA
+ TEST_BF16 = False
+@@ -243,9 +244,23 @@
+         tensor.fill_(1)
+         self.assertTrue((tensor == 1).all())
+
++    @unittest.skipIf(not TEST_CUDA_UVM, "VRAM over-subscription is possible with UVM only")
++    def test_vram_over_subscription(self):
++        torch.cuda.empty_cache()
++        total_memory = torch.cuda.get_device_properties(0).total_memory
++        size = int(total_memory * 1.5)  # Over-subscription
++        a = torch.empty(size , dtype=torch.int8, device='cuda')
++        self.assertEqual(a.numel() * a.element_size(), size)
++        del a
++        # We used a lot of memory here, clean up so we don't affect other tests too much
++        torch.cuda.empty_cache()
++        torch.cuda.reset_peak_memory_stats()
++
+     @unittest.skipIf(
+         TEST_CUDAMALLOCASYNC or IS_JETSON, "Segmentation fault (core dumped)"
+     )
++    @unittest.skipIf(TEST_CUDA_UVM, "UVM allows VRAM over-subscription so no retry would occur")
++     )
+     @serialTest()
+     def test_out_of_memory_retry(self):
+         torch.cuda.empty_cache()
+@@ -266,6 +281,7 @@
+         torch.cuda.empty_cache()
+         torch.cuda.reset_peak_memory_stats()
+
++    @unittest.skipIf(TEST_CUDA_UVM, "With UVM enabled, max_memory_reserved can be greater than total memory")
+     @serialTest()
+     def test_set_per_process_memory_fraction(self):
+         # test invalid fraction value.
+@@ -762,6 +778,7 @@
+         self.assertNotEqual(t.data_ptr(), ptr, msg="allocation re-used too soon")
+         self.assertEqual(list(gpu_tensor), [1])
+
++    @unittest.skipIf(TEST_CUDA_UVM, "It's hard to trigger OOM with UVM enabled")
+     def test_caching_allocator_record_stream_oom(self):
+         """allocations delayed by a record_stream call should still be freed on
+         an out-of-memory in cuda_malloc_retry. see issue #19219"""
+@@ -1876,6 +1893,7 @@
+     @unittest.skipIf(
+         IS_JETSON, "oom reporting has issues on jetson igx due to partial nvml support"
+     )
++    @unittest.skipIf(TEST_CUDA_UVM, "It's hard to trigger OOM with UVM enabled")
+     def test_graph_capture_oom(self):
+         oom_regex = (
+             "would exceed allowed memory" if TEST_CUDAMALLOCASYNC else "out of memory"
+@@ -3747,6 +3765,7 @@
+                 "pinned_num_register_threads:1024"
+             )
+
++    @unittest.skipIf(TEST_CUDA_UVM, "It's hard to trigger OOM with UVM enabled")
+     @parametrize("max_split_size_mb_setting", [False, True])
+     def test_raises_oom(self, max_split_size_mb_setting):
+         if max_split_size_mb_setting:
+@@ -3814,6 +3833,7 @@
+             finally:
+                 m.record(False, False)
+
++    @unittest.skipIf(TEST_CUDA_UVM, "It's hard to trigger OOM with UVM enabled")
+     @unittest.skipIf(TEST_CUDAMALLOCASYNC, "temporarily disabled")
+     def test_notifies_oom(self):
+         x = False
